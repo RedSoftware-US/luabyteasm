@@ -1,3 +1,5 @@
+local struct = require("struct")
+
 local DEBUG = true
 local function dprint(...) if DEBUG then print("[DEBUG]", ...) end end
 
@@ -64,6 +66,7 @@ local function create_asbx(op, a, sbx)
     local bx = (sbx or 0) + MAXARG_sBx
     return create_abx(op, a, bx)
 end
+
 
 local function parse_register(str)
     local num = tonumber(str:match("^R(%d+)$"))
@@ -246,8 +249,12 @@ local function new_writer(opts)
     end
 
     function w:write_number(n)
-        local fmt = little_endian and "<d" or ">d"
-        local bytes = string.pack(fmt, n)
+        local bytes
+        if little_endian then
+            bytes = struct.pack("<d", n)
+        else
+            bytes = struct.pack(">d", n)
+        end
         self:write_raw_bytes(bytes)
     end
 
@@ -268,24 +275,19 @@ local function make_luac_header(opts)
     local lua_number_is_integral = opts.lua_number_is_integral and 1 or 0
 
     local out = {}
-    -- Lua signature
     out[#out + 1] = string.char(0x1B, string.byte("L"), string.byte("u"), string.byte("a"))
-    -- Version (5.2 = 0x52, format version = 0)
     out[#out + 1] = string.char(0x52, 0)
-    -- Format info
     out[#out + 1] = string.char(is_little and 1 or 0)           -- endianness
     out[#out + 1] = string.char(sizeof_int)                     -- sizeof(int)
     out[#out + 1] = string.char(sizeof_size_t)                  -- sizeof(size_t)
     out[#out + 1] = string.char(sizeof_instruction)             -- sizeof(Instruction)
     out[#out + 1] = string.char(sizeof_lua_number)              -- sizeof(lua_Number)
     out[#out + 1] = string.char(lua_number_is_integral)         -- lua_Number is integral
-    -- LUAC_TAIL - magic bytes to verify header integrity
     out[#out + 1] = string.char(0x19, 0x93, 0x0D, 0x0A, 0x1A, 0x0A)
 
     return table.concat(out)
 end
 
--- Lua 5.2 constant types
 local LUA_TNIL = 0
 local LUA_TBOOLEAN = 1
 local LUA_TNUMBER = 3
@@ -402,11 +404,121 @@ local function assemble_lua(chunk)
             upvalues = {},
             lineinfo = {},
             locals = {},
-            upvalue_names = {}
+            upvalue_names = {},
+            _labels = {},
+            _pending = {},
         }
     end
 
     local current_section = nil
+
+    local free_regs = {}
+    local scopes = {}
+    local for_stack = {}
+
+    local reserved_counts = {}
+
+    local function push_scope()
+        scopes[#scopes + 1] = { names = {}, allocated = {} }
+        dprint("PUSH SCOPE, depth=", #scopes)
+    end
+    local function pop_scope()
+        local s = table.remove(scopes)
+        if not s then return end
+        dprint("POP SCOPE, freeing:", next(s.allocated) and table.concat((function() local a={} for k in pairs(s.allocated) do a[#a+1]=k end return a end)(), ", ") or "<none>")
+        for name, reg in pairs(s.allocated) do
+            s.names[name] = nil
+            if not reserved_counts[reg] or reserved_counts[reg] == 0 then
+                free_regs[#free_regs + 1] = reg
+                dprint("Recycled register R" .. reg .. " from name $" .. name)
+            else
+                dprint("Skipping recycle of reserved R" .. reg .. " from name $" .. name)
+            end
+        end
+    end
+
+    local function lookup_reg_by_name(name)
+        for i = #scopes, 1, -1 do
+            local s = scopes[i]
+            if s.names[name] then return s.names[name] end
+        end
+        return nil
+    end
+
+    local function find_scope_with_reg(regnum)
+        for i = #scopes, 1, -1 do
+            local s = scopes[i]
+            for _name, r in pairs(s.allocated) do
+                if r == regnum then return s end
+            end
+        end
+        return scopes[#scopes]
+    end
+
+    local function pop_free_nonreserved()
+        for i = #free_regs, 1, -1 do
+            local r = free_regs[i]
+            if not reserved_counts[r] or reserved_counts[r] == 0 then
+                table.remove(free_regs, i)
+                return r
+            end
+        end
+        return nil
+    end
+
+    local function alloc_reg_for_name(name)
+        local existing = lookup_reg_by_name(name)
+        if existing then return existing end
+        if #scopes == 0 then push_scope() end
+        local top = scopes[#scopes]
+
+        local reg = pop_free_nonreserved()
+        if reg then
+            dprint("Reusing register R" .. reg .. " for $" .. name)
+        else
+            reg = max_register + 1
+            max_register = reg
+            dprint("Allocating new register R" .. reg .. " for $" .. name)
+        end
+
+        top.names[name] = reg
+        top.allocated[name] = reg
+        return reg
+    end
+
+    local function reg_token_to_R(token)
+        if not token then return token end
+        local nm = token:match("^%$([%w_]+)$")
+        if nm then
+            local existing = lookup_reg_by_name(nm)
+            if existing then return "R" .. tostring(existing) end
+
+            if nm == "val" and #for_stack > 0 then
+                local for_entry = for_stack[#for_stack]
+                local base = for_entry.base
+                local reg = base + 3
+                if reg > max_register then max_register = reg end
+                local scope_for_base = find_scope_with_reg(base) or scopes[#scopes]
+                scope_for_base.names[nm] = reg
+                scope_for_base.allocated[nm] = reg
+                dprint("Binding $val to loop control R" .. reg .. " (base R" .. base .. ")")
+                return "R" .. tostring(reg)
+            end
+
+            local rnum = alloc_reg_for_name(nm)
+            return "R" .. tostring(rnum)
+        end
+        if token:match("^R%d+$") then return token end
+        return token
+    end
+
+    local function transform_parts(parts)
+        local out = {}
+        for i, p in ipairs(parts) do
+            out[i] = reg_token_to_R(p)
+        end
+        return out
+    end
 
     for line in chunk:gmatch("[^\r\n]+") do
         line = line:match("^%s*(.-)%s*$")
@@ -428,43 +540,125 @@ local function assemble_lua(chunk)
                 stack[#stack + 1] = p
                 if not root_proto then root_proto = p end
                 current_section = nil
+                free_regs = {}
+                scopes = {}
+                max_register = 0
+                for_stack = {}
+                reserved_counts = {}
+                push_scope()
+
             elseif directive == "endfn" then
                 dprint("Ending function")
                 local finished = table.remove(stack)
                 if not finished then error(".endfn with no matching .fn") end
+
+                for _, p in ipairs(finished._pending) do
+                    local cur = p.idx
+                    local target = finished._labels[p.label]
+                    assert(target, "unknown label: "..tostring(p.label))
+                    local sBx = target - (cur + 1)
+                    local a_token = p.a
+                    if type(a_token) == "string" and a_token:match("^%$") then
+                        a_token = reg_token_to_R(a_token)
+                    end
+                    local args = { a_token, tostring(sBx) }
+                    finished.code[cur] = encode_instruction(p.opname, args)
+                end
+                finished._labels, finished._pending = nil, nil
+
                 local parent = stack[#stack]
                 if parent then
                     parent.protos[#parent.protos + 1] = finished
                 end
                 current_section = nil
                 if #stack == 0 then break end
+
+            elseif directive == "scope" then
+                dprint(".scope encountered")
+                push_scope()
+
+            elseif directive == "endscope" then
+                dprint(".endscope encountered")
+                pop_scope()
+
             else
                 dprint("Section:", directive)
                 current_section = directive
             end
+
         else
             local proto = stack[#stack]
             if not proto then error("instruction outside of .fn block: " .. line) end
 
             if current_section == "instruction" then
-                local parts = {}
-                for part in line:gmatch("%S+") do parts[#parts + 1] = part end
-                if #parts > 0 then
-                    local opname = table.remove(parts, 1)
-                    dprint("Encoding instruction:", opname, table.concat(parts, " "))
-                    local inst = encode_instruction(opname, parts)
-                    dprint("Encoded as:", inst)
-                    proto.code[#proto.code + 1] = inst
-                    for _, part in ipairs(parts) do
-                        local reg = part:match("^R(%d+)$")
-                        if reg then
-                            local rnum = tonumber(reg)
-                            if rnum and rnum > max_register then
-                                max_register = rnum
+                local label = line:match("^([%w_]+):%s*$")
+                if label then
+                    proto._labels[label] = #(proto.code) + 1
+                else
+                    local parts = {}
+                    for part in line:gmatch("%S+") do parts[#parts + 1] = part end
+                    if #parts > 0 then
+                        local opname = table.remove(parts, 1)
+                        dprint("Encoding instruction:", opname, table.concat(parts, " "))
+
+                        local transformed = transform_parts(parts)
+
+                        if opname == "FORPREP" then
+                            local base_token = transformed[1]
+                            local base_reg = tonumber(base_token and base_token:match("^R(%d+)$"))
+                            if base_reg then
+                                local reserved = base_reg + 3
+                                reserved_counts[reserved] = (reserved_counts[reserved] or 0) + 1
+                                if reserved > max_register then max_register = reserved end
+                                for_stack[#for_stack + 1] = { base = base_reg, reserved = reserved }
+                                dprint("PUSH FOR BASE R" .. base_reg .. " (reserved R" .. reserved .. ")")
+                            end
+                        end
+
+                        if (opname == "FORPREP" or opname == "FORLOOP" or opname == "JMP" or opname == "TFORLOOP")
+                           and not tonumber(parts[2] or "") then
+                            proto._pending[#proto._pending+1] = {
+                                idx = #(proto.code)+1,
+                                opname = opname,
+                                a = transformed[1],
+                                label = parts[2],
+                            }
+                            proto.code[#proto.code+1] = 0
+                        else
+                            local inst = encode_instruction(opname, transformed)
+                            dprint("Encoded as:", inst)
+                            proto.code[#proto.code + 1] = inst
+                        end
+
+                        if opname == "FORLOOP" then
+                            local fe = table.remove(for_stack)
+                            if fe then
+                                local reserved = fe.reserved
+                                reserved_counts[reserved] = (reserved_counts[reserved] or 1) - 1
+                                if reserved_counts[reserved] <= 0 then
+                                    reserved_counts[reserved] = nil
+                                    dprint("UNRESERVED R" .. reserved)
+                                else
+                                    dprint("Deferred unreserve of R" .. reserved .. " (count=" .. reserved_counts[reserved] .. ")")
+                                end
+                                dprint("POP FOR BASE R" .. tostring(fe.base))
+                            else
+                                dprint("Warning: FORLOOP without matching FORPREP on for_stack")
+                            end
+                        end
+
+                        for _, tpart in ipairs(transformed) do
+                            local reg = tpart:match("^R(%d+)$")
+                            if reg then
+                                local rnum = tonumber(reg)
+                                if rnum and rnum > max_register then
+                                    max_register = rnum
+                                end
                             end
                         end
                     end
                 end
+
             elseif current_section == "const" then
                 local key, value = line:match("^(%S+)%s*=%s*(.+)")
                 if key and value then
@@ -485,6 +679,7 @@ local function assemble_lua(chunk)
                         proto.constants[idx + 1] = value
                     end
                 end
+
             elseif current_section == "upvalue" then
                 local key, instack, idx = line:match("^(U%d+)%s*=%s*L(%d+)%s+R(%d+)")
                 if key and instack and idx then
@@ -498,6 +693,7 @@ local function assemble_lua(chunk)
                         proto.upvalue_names[uv_idx + 1] = "_ENV"
                     end
                 end
+
             elseif current_section == "header" then
                 for k, v in line:gmatch("(%w+)%s*=%s*([^,%s]+)") do
                     dprint("Header:", k, "=", v)
@@ -566,25 +762,43 @@ local function hexdump(data, limit)
     end
 end
 
-local hello_world_chunk = [[
-    .fn @hello.lua
-    .header
-    numparams=0, is_vararg=1, maxstack=3
-    .instruction
-    GETTABUP  R0 U0 K0
-    LOADK     R1 K1
-    CALL      R0 2 1
-    RETURN    R0 1
-    .const
-    K0 = "print"
-    K1 = "Hello, World!"
-    .upvalue
+local chunk = [[
+.fn @loop.lua
+.header
+numparams=0, is_vararg=1, maxstack=6
+.instruction
+.scope
+    LOADK     $idx K0
+    LOADK     $limit K1
+    LOADK     $step K2
+
+    FORPREP   $idx Lloop
+
+Lbody:
+.scope
+    GETTABUP  $f U0 K3
+    MOVE      $arg $val
+    CALL      $f 2 1
+.endscope
+
+Lloop:
+    FORLOOP   $idx Lbody
+
+    RETURN    $idx 1
+.endscope
+.const
+    K0 = 1
+    K1 = 3
+    K2 = 1
+    K3 = "print"
+.upvalue
     U0 = L0 R0
-    .endfn
+.endfn
+
 ]]
 
 dprint("Starting bytecode generation")
-local bytecode = assemble_lua(hello_world_chunk)
+local bytecode = assemble_lua(chunk)
 dprint("Bytecode generated, length:", #bytecode)
 
 dprint("Complete bytecode hex dump:")
