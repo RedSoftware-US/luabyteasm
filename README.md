@@ -169,6 +169,14 @@ luabyteasm is released under the Apache 2.0 License.
 
 ---
 
+**Contact:**
+
+* GitHub: `https://github.com/RedSoftware-US/NexCore`
+* Discord: `red.software`
+* Email: `redsoftware-us@proton.me`
+
+---
+
 ## FAQ (brief)
 
 **Q: Does luabyteasm compile Lua source?**
